@@ -73,7 +73,9 @@ export default function ChatInterface({
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        await onChunk(new TextDecoder().decode(value));
+        const chunk = new TextDecoder().decode(value);
+        console.log('[SSE] Raw chunk received:', chunk);
+        await onChunk(chunk);
       }
     } finally {
       reader.releaseLock();
@@ -91,16 +93,29 @@ export default function ChatInterface({
     setCurrentTool(null);
     setIsLoading(true);
 
-    // Add user's message immediately for better UX
-    const optimisticUserMessage: Doc<"messages"> = {
-      _id: `temp_${Date.now()}`,
+    // Save the user message to the database first
+    const convex = getConvexClient();
+    const userMessageStoreResult = await convex.mutation(api.messages.store, {
       chatId,
       content: trimmedInput,
       role: "user",
-      createdAt: Date.now(),
-    } as Doc<"messages">;
+    });
 
-    setMessages((prev) => [...prev, optimisticUserMessage]);
+    // Assume userMessageStoreResult contains at least the _id (or messageId)
+    // and chatId. Based on previous logs for assistant messages, Convex returns messageId and chatId.
+    const returnedUserData = userMessageStoreResult as unknown as { messageId: Id<"messages">; chatId: Id<"chats">; role: string };
+
+    const userMessageForState: Doc<"messages"> = {
+      _id: returnedUserData.messageId,
+      chatId: returnedUserData.chatId || chatId, // Prefer returned chatId, fallback to component's chatId
+      content: trimmedInput,                     // CRITICAL: Use the original trimmedInput for content
+      role: "user",
+      _creationTime: Date.now(),                 // Fallback, as Convex might not return this for the UI
+      createdAt: Date.now(),                     // Fallback, as per previous linter fixes and type requirements
+    };
+
+    // Update messages with the correctly constructed user message
+    setMessages((prev) => [...prev, userMessageForState]);
 
     // Track complete response for saving to database
     let fullResponse = "";
@@ -108,13 +123,21 @@ export default function ChatInterface({
     try {
       // Prepare chat history and new message for API
       const requestBody: ChatRequestBody = {
-        messages: messages.map((msg) => ({
-          role: msg.role,
-          content: msg.content,
-        })),
+        messages: [
+          ...messages.map((msg) => ({
+            role: msg.role,
+            content: msg.content,
+          })),
+          {
+            role: "user" as const,
+            content: trimmedInput,
+          }
+        ],
         newMessage: trimmedInput,
         chatId,
       };
+
+      console.log('[Chat] Sending request:', requestBody);
 
       // Initialize SSE connection
       const response = await fetch("/api/chat/stream", {
@@ -134,21 +157,27 @@ export default function ChatInterface({
       await processStream(reader, async (chunk) => {
         // Parse SSE messages from the chunk
         const messages = parser.parse(chunk);
+        console.log('[Chat] Parsed messages:', messages);
 
         // Handle each message based on its type
         for (const message of messages) {
+          console.log('[Chat] Processing message:', message);
           switch (message.type) {
             case StreamMessageType.Token:
-              // Handle streaming tokens (normal text response)
-              if ("token" in message) {
-                fullResponse += message.token;
-                setStreamedResponse(fullResponse);
-              }
+              console.log("[Chat] Received token:", message.token);
+              setStreamedResponse((prev) => {
+                console.log('[Chat] Previous response:', prev);
+                const newResponse = prev + message.token;
+                console.log('[Chat] New response:', newResponse);
+                return newResponse;
+              });
+              fullResponse += message.token;
               break;
 
             case StreamMessageType.ToolStart:
               // Handle start of tool execution (e.g. API calls, file operations)
               if ("tool" in message) {
+                console.log('[Chat] Tool started:', message.tool);
                 setCurrentTool({
                   name: message.tool,
                   input: message.input,
@@ -165,6 +194,7 @@ export default function ChatInterface({
             case StreamMessageType.ToolEnd:
               // Handle completion of tool execution
               if ("tool" in message && currentTool) {
+                console.log('[Chat] Tool ended:', message.tool);
                 // Replace the "Processing..." message with actual output
                 const lastTerminalIndex = fullResponse.lastIndexOf(
                   '<div class="bg-[#1e1e1e]'
@@ -186,30 +216,49 @@ export default function ChatInterface({
             case StreamMessageType.Error:
               // Handle error messages from the stream
               if ("error" in message) {
+                console.error('[Chat] Error message received:', message.error);
                 throw new Error(message.error);
               }
               break;
 
             case StreamMessageType.Done:
-              // Handle completion of the entire response
-              const assistantMessage: Doc<"messages"> = {
-                _id: `temp_assistant_${Date.now()}`,
-                chatId,
-                content: fullResponse,
-                role: "assistant",
-                createdAt: Date.now(),
-              } as Doc<"messages">;
+              console.log('[Chat] Stream completed');
+              // Only store the assistant message if the response is not empty
+              if (fullResponse.trim().length > 0) {
+                const storeMutationResult = await convex.mutation(api.messages.store, {
+                  chatId,
+                  content: fullResponse,
+                  role: "assistant",
+                });
 
-              // Save the complete message to the database
-              const convex = getConvexClient();
-              await convex.mutation(api.messages.store, {
-                chatId,
-                content: fullResponse,
-                role: "assistant",
-              });
+                // Assuming storeMutationResult contains at least the _id (or messageId) and other identifiers.
+                // Based on logs: { messageId: Id<"messages">, chatId: Id<"chats">, role: "assistant" }
+                // We need to ensure the object added to state is a complete Doc<"messages">.
+                // Let's assume the result object has a 'messageId' field for the ID.
+                const returnedData = storeMutationResult as unknown as { messageId: Id<"messages">; chatId: Id<"chats">; role: string /* and potentially other fields */ };
 
-              setMessages((prev) => [...prev, assistantMessage]);
-              setStreamedResponse("");
+                const newAssistantMessageForState: Doc<"messages"> = {
+                  _id: returnedData.messageId,
+                  chatId: returnedData.chatId || chatId,
+                  role: "assistant",
+                  content: fullResponse,
+                  _creationTime: Date.now(),
+                  createdAt: Date.now(),
+                };
+
+                // Update messages with the correctly constructed assistant message
+                setMessages((prev) => [...prev, newAssistantMessageForState]);
+                setStreamedResponse("");
+              } else {
+                // Show an error message in the chat if the assistant response is empty
+                setStreamedResponse(
+                  formatTerminalOutput(
+                    "error",
+                    "Assistant did not return a response.",
+                    "No response generated. Please try again or rephrase your question."
+                  )
+                );
+              }
               return;
           }
         }
@@ -219,7 +268,7 @@ export default function ChatInterface({
       console.error("Error sending message:", error);
       // Remove the optimistic user message if there was an error
       setMessages((prev) =>
-        prev.filter((msg) => msg._id !== optimisticUserMessage._id)
+        prev.filter((msg) => msg._id !== userMessageForState._id)
       );
       setStreamedResponse(
         formatTerminalOutput(
@@ -234,15 +283,18 @@ export default function ChatInterface({
   };
 
   return (
-    <main className="flex flex-col h-[calc(100vh-theme(spacing.14))]">
+    <main 
+      className="flex flex-col h-[calc(100vh-theme(spacing.14))]"
+      suppressHydrationWarning
+    >
       {/* Messages container */}
       <section className="flex-1 overflow-y-auto bg-gray-50 p-2 md:p-0">
         <div className="max-w-4xl mx-auto p-4 space-y-3">
           {messages?.length === 0 && <WelcomeMessage />}
 
-          {messages?.map((message: Doc<"messages">) => (
+          {messages?.map((message, index) => (
             <MessageBubble
-              key={message._id}
+              key={message._id?.toString() || `msg_${index}`}
               content={message.content}
               isUser={message.role === "user"}
             />

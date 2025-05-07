@@ -9,7 +9,9 @@ interface MessageBubbleProps {
   isUser?: boolean;
 }
 
-const formatMessage = (content: string): string => {
+const formatMessage = (content: string | undefined): string => {
+  if (!content) return '';
+  
   // First unescape backslashes
   content = content.replace(/\\\\/g, "\\");
 
